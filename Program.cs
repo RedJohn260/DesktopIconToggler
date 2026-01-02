@@ -19,7 +19,7 @@ static class Program
 // --- 1. THE MAIN CONTROLLER ---
 public class TrayContext : ApplicationContext
 {
-    private readonly Version currentVersion = new Version("1.0.0");
+    private readonly Version currentVersion = new Version("1.0.1");
     private readonly string repoUrl = "https://api.github.com/repos/RedJohn260/DesktopIconToggler/releases/latest";
 
     private NotifyIcon trayIcon;
