@@ -19,7 +19,7 @@ static class Program
 // --- 1. THE MAIN CONTROLLER ---
 public class TrayContext : ApplicationContext
 {
-    private readonly Version currentVersion = new Version("1.0.3");
+    private readonly Version currentVersion = new Version("1.0.4");
     private readonly string repoUrl = "https://api.github.com/repos/RedJohn260/DesktopIconToggler/releases/latest";
 
     private NotifyIcon trayIcon;
@@ -46,19 +46,21 @@ public class TrayContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add("Toggle Desktop Icons", null, (s, e) => DesktopManager.ToggleIcons());
         menu.Items.Add(new ToolStripSeparator());
-
         var startupItem = new ToolStripMenuItem("Run at Windows Startup") { CheckOnClick = true };
         startupItem.Checked = CheckStartup();
         startupItem.Click += (s, e) => SetStartup(startupItem.Checked);
         menu.Items.Add(startupItem);
         menu.Items.Add(new ToolStripSeparator());
-
         // Dynamic Hotkey Menu Item
         hotkeyMenuItem = new ToolStripMenuItem("Change Hotkey", null, (s, e) => ShowHotkeySettings());
         menu.Items.Add(hotkeyMenuItem);
-
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Check for Updates", null, async (s, e) => await CheckForUpdates(false));
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("About", null, (s, e) => {
+            using var about = new AboutWindow(currentVersion.ToString());
+            about.ShowDialog();
+        });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (s, e) => Exit());
 
@@ -173,21 +175,90 @@ public class TrayContext : ApplicationContext
     {
         string currentPath = Environment.ProcessPath!;
         string tempPath = currentPath + ".new";
-        using (var client = new HttpClient())
+
+        using var progressForm = new UpdateProgressForm();
+        progressForm.Show();
+
+        try
         {
-            var data = await client.GetByteArrayAsync(url);
-            await File.WriteAllBytesAsync(tempPath, data);
+            using var client = new HttpClient();
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, progressForm.CTS.Token);
+            response.EnsureSuccessStatusCode();
+
+            var totalBytes = response.Content.Headers.ContentLength ?? -1L;
+            using var contentStream = await response.Content.ReadAsStreamAsync(progressForm.CTS.Token);
+            using var fileStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true);
+
+            var buffer = new byte[8192];
+            long totalRead = 0;
+            int read;
+
+            var sw = Stopwatch.StartNew();
+            long lastTickBytes = 0;
+            double lastTickTime = 0;
+            double smoothedSpeed = 0;
+
+            while ((read = await contentStream.ReadAsync(buffer, 0, buffer.Length, progressForm.CTS.Token)) > 0)
+            {
+                await fileStream.WriteAsync(buffer, 0, read, progressForm.CTS.Token);
+                totalRead += read;
+
+                if (sw.Elapsed.TotalMilliseconds - lastTickTime > 500)
+                {
+                    double timeDelta = (sw.Elapsed.TotalMilliseconds - lastTickTime) / 1000.0;
+                    long byteDelta = totalRead - lastTickBytes;
+                    double currentSpeed = (byteDelta / 1024.0) / timeDelta;
+
+                    // Weighted Moving Average to fix speed jittering
+                    smoothedSpeed = (smoothedSpeed == 0) ? currentSpeed : (smoothedSpeed * 0.7) + (currentSpeed * 0.3);
+
+                    int percent = totalBytes != -1 ? (int)((totalRead * 100) / totalBytes) : 0;
+                    string stats = $"{(totalRead / 1024.0 / 1024.0):F2} MB / {(totalBytes / 1024.0 / 1024.0):F2} MB ({smoothedSpeed:F1} KB/s)";
+
+                    progressForm.UpdateProgress(percent, stats);
+
+                    lastTickTime = sw.Elapsed.TotalMilliseconds;
+                    lastTickBytes = totalRead;
+                }
+            }
+
+            sw.Stop();
+            fileStream.Close();
+
+            if (progressForm.CTS.IsCancellationRequested) return;
+
+            progressForm.SetStatus("Download Complete!");
+            MessageBox.Show("Download successful. Press OK to apply the update and restart.", "Update Ready", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (OperationCanceledException)
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+            return;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Update failed: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+            return;
         }
 
+        // Improved Batch Script with a retry loop to prevent 'File In Use' errors
         string batchScript = $@"
-        @echo off
-        timeout /t 1 /nobreak > nul
-        del ""{currentPath}""
-        move ""{tempPath}"" ""{currentPath}""
-        start """" ""{currentPath}""
-        del ""%~f0""";
+            @echo off
+            timeout /t 1 /nobreak > nul
+            :loop
+            del ""{currentPath}""
+            if exist ""{currentPath}"" (
+                timeout /t 1 /nobreak > nul
+                goto loop
+            )
+            move ""{tempPath}"" ""{currentPath}""
+            start """" ""{currentPath}""
+            del ""%~f0""";
+
         string batchPath = Path.Combine(Path.GetTempPath(), "update_toggler.bat");
         File.WriteAllText(batchPath, batchScript);
+
         Process.Start(new ProcessStartInfo { FileName = batchPath, CreateNoWindow = true, UseShellExecute = false });
         Application.Exit();
     }
@@ -278,5 +349,106 @@ public class HotkeySettingsForm : Form
 
         btn.Click += (s, e) => { this.DialogResult = DialogResult.OK; this.Close(); };
         this.Controls.Add(lbl); this.Controls.Add(btn);
+    }
+}
+public class UpdateProgressForm : Form
+{
+    private ProgressBar pb;
+    private Label lblStatus;
+    private Label lblStats;
+    private Button btnCancel;
+    public CancellationTokenSource CTS { get; private set; }
+
+    public UpdateProgressForm()
+    {
+        CTS = new CancellationTokenSource();
+        this.Text = "Updating Desktop Icon Toggler";
+        this.Size = new Size(400, 200);
+        this.StartPosition = FormStartPosition.CenterScreen;
+        this.FormBorderStyle = FormBorderStyle.FixedDialog;
+        this.MaximizeBox = true; // Allows minimizing
+        this.TopMost = false;
+
+        lblStatus = new Label { Text = "Downloading...", Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.BottomCenter };
+        lblStats = new Label { Text = "Initializing...", Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.TopCenter, Font = new Font(this.Font.FontFamily, 8) };
+
+        pb = new ProgressBar { Width = 340, Height = 25, Location = new Point(25, 75), Maximum = 100 };
+
+        btnCancel = new Button { Text = "Cancel Update", Width = 120, Height = 30, Location = new Point(135, 115) };
+        btnCancel.Click += (s, e) => { CTS.Cancel(); this.Close(); };
+
+        // Handle the 'X' close button as a cancellation
+        this.FormClosing += (s, e) => { if (!CTS.IsCancellationRequested) CTS.Cancel(); };
+
+        this.Controls.Add(pb);
+        this.Controls.Add(btnCancel);
+        this.Controls.Add(lblStats);
+        this.Controls.Add(lblStatus);
+    }
+
+    public void UpdateProgress(int percent, string stats)
+    {
+        if (this.IsDisposed) return;
+        if (this.InvokeRequired) { this.Invoke(() => UpdateProgress(percent, stats)); return; }
+        pb.Value = percent;
+        lblStats.Text = stats;
+    }
+
+    public void SetStatus(string text)
+    {
+        if (this.IsDisposed) return;
+        if (this.InvokeRequired) { this.Invoke(() => SetStatus(text)); return; }
+        lblStatus.Text = text;
+    }
+}
+public class AboutWindow : Form
+{
+    public AboutWindow(string version)
+    {
+        this.Text = "About Desktop Icon Toggler";
+        this.Size = new Size(300, 180);
+        this.StartPosition = FormStartPosition.CenterScreen;
+        this.FormBorderStyle = FormBorderStyle.FixedDialog;
+        this.MaximizeBox = false;
+        this.MinimizeBox = false;
+
+        var lblName = new Label
+        {
+            Text = "Created by RedJohn260",
+            Dock = DockStyle.Top,
+            Height = 40,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = new Font(this.Font, FontStyle.Bold)
+        };
+
+        var lblVersion = new Label
+        {
+            Text = $"Version: {version}",
+            Dock = DockStyle.Top,
+            Height = 30,
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+
+        var link = new LinkLabel
+        {
+            Text = "GitHub Repository",
+            Dock = DockStyle.Top,
+            Height = 30,
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+        link.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo("https://github.com/RedJohn260/DesktopIconToggler") { UseShellExecute = true });
+
+        var btnOk = new Button
+        {
+            Text = "OK",
+            DialogResult = DialogResult.OK,
+            Dock = DockStyle.Bottom,
+            Height = 30
+        };
+
+        this.Controls.Add(link);
+        this.Controls.Add(lblVersion);
+        this.Controls.Add(lblName);
+        this.Controls.Add(btnOk);
     }
 }
