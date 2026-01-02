@@ -12,11 +12,11 @@
 		<PublishReadyToRun>true</PublishReadyToRun>
 		<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
 		<Platforms>AnyCPU;x64</Platforms>
-		<ApplicationIcon>Icon.ico</ApplicationIcon>
+		<ApplicationIcon>Images\Icon.ico</ApplicationIcon>
 	</PropertyGroup>
 
 	<ItemGroup>
-	  <Content Include="Icon.ico" />
+	  <Content Include="Images\Icon.ico" />
 	</ItemGroup>
 
 </Project>
