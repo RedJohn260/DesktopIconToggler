@@ -19,27 +19,44 @@ static class Program
 // --- 1. THE MAIN CONTROLLER ---
 public class TrayContext : ApplicationContext
 {
-    private readonly Version currentVersion = new Version("1.0.1");
+    private readonly Version currentVersion = new Version("1.0.3");
     private readonly string repoUrl = "https://api.github.com/repos/RedJohn260/DesktopIconToggler/releases/latest";
 
     private NotifyIcon trayIcon;
     private HotkeyWindow hotkeyHandler = new();
-    private Keys currentHotkey = Keys.D; // Default: Ctrl + D
+
+    // Hotkey State
+    private Keys currentHotkey = Keys.D;
+    private uint currentModifier = 0x0002; // Default: MOD_CONTROL
     private const int HOTKEY_ID = 1;
+
+    // Win32 Modifier Constants
+    private const uint MOD_ALT = 0x0001;
+    private const uint MOD_CONTROL = 0x0002;
+    private const uint MOD_SHIFT = 0x0004;
+    private const uint MOD_WIN = 0x0008;
+
+    private ToolStripMenuItem hotkeyMenuItem;
 
     public TrayContext()
     {
+        LoadHotkeySettings(); // Load from Registry
+
         // Setup Menu
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Toggle Icons Now", null, (s, e) => DesktopManager.ToggleIcons());
+        menu.Items.Add("Toggle Desktop Icons", null, (s, e) => DesktopManager.ToggleIcons());
         menu.Items.Add(new ToolStripSeparator());
 
-        var startupItem = new ToolStripMenuItem("Run at Startup") { CheckOnClick = true };
+        var startupItem = new ToolStripMenuItem("Run at Windows Startup") { CheckOnClick = true };
         startupItem.Checked = CheckStartup();
         startupItem.Click += (s, e) => SetStartup(startupItem.Checked);
         menu.Items.Add(startupItem);
+        menu.Items.Add(new ToolStripSeparator());
 
-        menu.Items.Add("Change Hotkey (Ctrl + ?)", null, (s, e) => ShowHotkeySettings());
+        // Dynamic Hotkey Menu Item
+        hotkeyMenuItem = new ToolStripMenuItem("Change Hotkey", null, (s, e) => ShowHotkeySettings());
+        menu.Items.Add(hotkeyMenuItem);
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Check for Updates", null, async (s, e) => await CheckForUpdates(false));
         menu.Items.Add(new ToolStripSeparator());
@@ -48,33 +65,67 @@ public class TrayContext : ApplicationContext
         // Setup Tray Icon
         trayIcon = new NotifyIcon()
         {
-            Icon = SystemIcons.Application,
+            Icon = Properties.Resources.Icon, // Resources icon!
             ContextMenuStrip = menu,
             Visible = true,
-            Text = "Desktop Toggler (Ctrl+D)"
+            Text = "Desktop Icon Toggler"
         };
 
-        // Listen for the hotkey press
         hotkeyHandler.HotkeyPressed += DesktopManager.ToggleIcons;
-        RegisterKey();
+        RegisterKey(); // Sets up the hotkey and updates the UI strings
+
         _ = CheckForUpdates(silent: true);
+    }
+
+    private string GetModifierName()
+    {
+        return currentModifier switch
+        {
+            MOD_CONTROL => "Ctrl",
+            MOD_ALT => "Alt",
+            MOD_SHIFT => "Shift",
+            MOD_WIN => "Win",
+            _ => "Ctrl"
+        };
     }
 
     private void RegisterKey()
     {
         hotkeyHandler.Unregister(HOTKEY_ID);
-        // MOD_CONTROL = 0x0002
-        hotkeyHandler.Register(HOTKEY_ID, 0x0002, (uint)currentHotkey);
-        trayIcon.Text = $"Desktop Toggler (Ctrl + {currentHotkey})";
+        hotkeyHandler.Register(HOTKEY_ID, currentModifier, (uint)currentHotkey);
+
+        string display = $"{GetModifierName()} + {currentHotkey}";
+        if (hotkeyMenuItem != null) hotkeyMenuItem.Text = $"Change Hotkey ({display})";
+        trayIcon.Text = $"Desktop Icon Toggler ({display})";
     }
 
     private void ShowHotkeySettings()
     {
-        using var form = new HotkeySettingsForm(currentHotkey);
+        using var form = new HotkeySettingsForm(currentHotkey, currentModifier);
         if (form.ShowDialog() == DialogResult.OK)
         {
             currentHotkey = form.SelectedKey;
+            currentModifier = form.SelectedModifier;
+            SaveHotkeySettings();
             RegisterKey();
+        }
+    }
+
+    // --- REGISTRY PERSISTENCE ---
+    private void SaveHotkeySettings()
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(@"Software\DesktopIconToggler");
+        key.SetValue("Hotkey", (int)currentHotkey);
+        key.SetValue("Modifier", (int)currentModifier);
+    }
+
+    private void LoadHotkeySettings()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(@"Software\DesktopIconToggler");
+        if (key != null)
+        {
+            currentHotkey = (Keys)Convert.ToInt32(key.GetValue("Hotkey") ?? Keys.D);
+            currentModifier = Convert.ToUInt32(key.GetValue("Modifier") ?? 0x0002);
         }
     }
 
@@ -93,12 +144,12 @@ public class TrayContext : ApplicationContext
         Application.Exit();
     }
 
+    // --- UPDATER LOGIC ---
     private async Task CheckForUpdates(bool silent = true)
     {
         try
         {
             using HttpClient client = new();
-            // GitHub API requires a User-Agent header
             client.DefaultRequestHeaders.Add("User-Agent", "DesktopIconToggler-Updater");
 
             var response = await client.GetFromJsonAsync<JsonElement>(repoUrl);
@@ -108,44 +159,35 @@ public class TrayContext : ApplicationContext
             if (latestVersion > currentVersion)
             {
                 var downloadUrl = response.GetProperty("assets")[0].GetProperty("browser_download_url").GetString();
-                if (MessageBox.Show($"New version {latestTag} available! Download now?", "Update Found", MessageBoxButtons.YesNo) == DialogResult.Yes)
+                if (MessageBox.Show($"New version {latestTag} available! Download now?", "DesktopIconToggler: Update Found", MessageBoxButtons.YesNo) == DialogResult.Yes)
                 {
                     await PerformUpdate(downloadUrl!);
                 }
             }
-            else if (!silent)
-            {
-                MessageBox.Show("You are on the latest version!", "No Updates");
-            }
+            else if (!silent) MessageBox.Show("Up to date!", "DesktopIconToggler");
         }
-        catch { if (!silent) MessageBox.Show("Could not check for updates."); }
+        catch { if (!silent) MessageBox.Show("Could not check for updates.", "DesktopIconToggler"); }
     }
 
     private async Task PerformUpdate(string url)
     {
         string currentPath = Environment.ProcessPath!;
         string tempPath = currentPath + ".new";
-
-        // 1. Download the new version
         using (var client = new HttpClient())
         {
             var data = await client.GetByteArrayAsync(url);
             await File.WriteAllBytesAsync(tempPath, data);
         }
 
-        // 2. Create a batch script to swap files after we exit
         string batchScript = $@"
         @echo off
         timeout /t 1 /nobreak > nul
         del ""{currentPath}""
         move ""{tempPath}"" ""{currentPath}""
         start """" ""{currentPath}""
-        del ""%~f0""
-        ";
+        del ""%~f0""";
         string batchPath = Path.Combine(Path.GetTempPath(), "update_toggler.bat");
         File.WriteAllText(batchPath, batchScript);
-
-        // 3. Run the script and exit
         Process.Start(new ProcessStartInfo { FileName = batchPath, CreateNoWindow = true, UseShellExecute = false });
         Application.Exit();
     }
@@ -163,7 +205,7 @@ public static class DesktopManager
         IntPtr handle = FindWindow("Progman", "Program Manager");
         handle = FindWindowEx(handle, IntPtr.Zero, "SHELLDLL_DefView", null);
 
-        if (handle == IntPtr.Zero) // Windows 10/11 multi-monitor fix
+        if (handle == IntPtr.Zero)
         {
             IntPtr workerW = IntPtr.Zero;
             while ((workerW = FindWindowEx(IntPtr.Zero, workerW, "WorkerW", null)) != IntPtr.Zero)
@@ -190,7 +232,7 @@ public class HotkeyWindow : NativeWindow
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == 0x0312) HotkeyPressed?.Invoke(); // WM_HOTKEY
+        if (m.Msg == 0x0312) HotkeyPressed?.Invoke();
         base.WndProc(ref m);
     }
 }
@@ -199,20 +241,42 @@ public class HotkeyWindow : NativeWindow
 public class HotkeySettingsForm : Form
 {
     public Keys SelectedKey { get; private set; }
-    public HotkeySettingsForm(Keys current)
+    public uint SelectedModifier { get; private set; }
+
+    public HotkeySettingsForm(Keys currentKey, uint currentMod)
     {
-        this.Text = "Settings"; this.Size = new Size(250, 120);
+        this.Text = "Hotkey Settings"; this.Size = new Size(300, 150);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.FormBorderStyle = FormBorderStyle.FixedToolWindow;
         this.KeyPreview = true;
-        SelectedKey = current;
+        this.TopMost = true;
 
-        var lbl = new Label { Text = $"Press a key (Ctrl + ...)\nCurrent: {current}", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter };
-        var btn = new Button { Text = "Save", Dock = DockStyle.Bottom };
+        SelectedKey = currentKey;
+        SelectedModifier = currentMod;
 
-        this.KeyDown += (s, e) => { if (e.KeyCode != Keys.ControlKey) { SelectedKey = e.KeyCode; lbl.Text = $"New Hotkey: Ctrl + {SelectedKey}"; } };
+        var lbl = new Label
+        {
+            Text = "Hold a Modifier (Ctrl/Alt/Shift) \nand press a Key to assign.",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter
+        };
+        var btn = new Button { Text = "Save Settings", Dock = DockStyle.Bottom };
+
+        this.KeyDown += (s, e) => {
+            uint mod = 0;
+            if (e.Control) mod = 0x0002;
+            else if (e.Alt) mod = 0x0001;
+            else if (e.Shift) mod = 0x0004;
+
+            if (e.KeyCode != Keys.ControlKey && e.KeyCode != Keys.Menu && e.KeyCode != Keys.ShiftKey)
+            {
+                SelectedKey = e.KeyCode;
+                SelectedModifier = mod != 0 ? mod : 0x0002; // Default to Ctrl
+                lbl.Text = $"New Hotkey: {e.Modifiers} + {SelectedKey}";
+            }
+        };
+
         btn.Click += (s, e) => { this.DialogResult = DialogResult.OK; this.Close(); };
-
         this.Controls.Add(lbl); this.Controls.Add(btn);
     }
 }
