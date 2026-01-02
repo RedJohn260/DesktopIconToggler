@@ -1,5 +1,8 @@
-using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using System.Diagnostics;
+using System.Net.Http.Json;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 
 namespace DesktopIconToggler;
 
@@ -16,6 +19,9 @@ static class Program
 // --- 1. THE MAIN CONTROLLER ---
 public class TrayContext : ApplicationContext
 {
+    private readonly Version currentVersion = new Version("1.0.0");
+    private readonly string repoUrl = "https://api.github.com/repos/RedJohn260/DesktopIconToggler/releases/latest";
+
     private NotifyIcon trayIcon;
     private HotkeyWindow hotkeyHandler = new();
     private Keys currentHotkey = Keys.D; // Default: Ctrl + D
@@ -35,6 +41,8 @@ public class TrayContext : ApplicationContext
 
         menu.Items.Add("Change Hotkey (Ctrl + ?)", null, (s, e) => ShowHotkeySettings());
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Check for Updates", null, async (s, e) => await CheckForUpdates(false));
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (s, e) => Exit());
 
         // Setup Tray Icon
@@ -49,6 +57,7 @@ public class TrayContext : ApplicationContext
         // Listen for the hotkey press
         hotkeyHandler.HotkeyPressed += DesktopManager.ToggleIcons;
         RegisterKey();
+        _ = CheckForUpdates(silent: true);
     }
 
     private void RegisterKey()
@@ -81,6 +90,63 @@ public class TrayContext : ApplicationContext
     private void Exit()
     {
         trayIcon.Visible = false;
+        Application.Exit();
+    }
+
+    private async Task CheckForUpdates(bool silent = true)
+    {
+        try
+        {
+            using HttpClient client = new();
+            // GitHub API requires a User-Agent header
+            client.DefaultRequestHeaders.Add("User-Agent", "DesktopIconToggler-Updater");
+
+            var response = await client.GetFromJsonAsync<JsonElement>(repoUrl);
+            string latestTag = response.GetProperty("tag_name").GetString()?.Replace("v", "") ?? "0.0.0";
+            Version latestVersion = new Version(latestTag);
+
+            if (latestVersion > currentVersion)
+            {
+                var downloadUrl = response.GetProperty("assets")[0].GetProperty("browser_download_url").GetString();
+                if (MessageBox.Show($"New version {latestTag} available! Download now?", "Update Found", MessageBoxButtons.YesNo) == DialogResult.Yes)
+                {
+                    await PerformUpdate(downloadUrl!);
+                }
+            }
+            else if (!silent)
+            {
+                MessageBox.Show("You are on the latest version!", "No Updates");
+            }
+        }
+        catch { if (!silent) MessageBox.Show("Could not check for updates."); }
+    }
+
+    private async Task PerformUpdate(string url)
+    {
+        string currentPath = Environment.ProcessPath!;
+        string tempPath = currentPath + ".new";
+
+        // 1. Download the new version
+        using (var client = new HttpClient())
+        {
+            var data = await client.GetByteArrayAsync(url);
+            await File.WriteAllBytesAsync(tempPath, data);
+        }
+
+        // 2. Create a batch script to swap files after we exit
+        string batchScript = $@"
+        @echo off
+        timeout /t 1 /nobreak > nul
+        del ""{currentPath}""
+        move ""{tempPath}"" ""{currentPath}""
+        start """" ""{currentPath}""
+        del ""%~f0""
+        ";
+        string batchPath = Path.Combine(Path.GetTempPath(), "update_toggler.bat");
+        File.WriteAllText(batchPath, batchScript);
+
+        // 3. Run the script and exit
+        Process.Start(new ProcessStartInfo { FileName = batchPath, CreateNoWindow = true, UseShellExecute = false });
         Application.Exit();
     }
 }
